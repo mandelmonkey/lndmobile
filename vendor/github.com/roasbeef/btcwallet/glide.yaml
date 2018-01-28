@@ -1,0 +1,49 @@
+package: github.com/roasbeef/btcwallet
+import:
+- package: github.com/boltdb/bolt
+  version: ^1.3.0
+- package: github.com/roasbeef/btcd
+  version: 5d9e4e1fa749fa2f1675802a4c9f10ef0ada04d1
+  subpackages:
+  - blockchain
+  - btcec
+  - btcjson
+  - chaincfg
+  - chaincfg/chainhash
+  - txscript
+  - wire
+- package: github.com/btcsuite/btclog
+- package: github.com/roasbeef/btcutil
+  version: c3ff179366044979fb9856c2feb79bd4c2184c7a
+  subpackages:
+  - hdkeychain
+- package: github.com/lightninglabs/neutrino
+  version: 36dd930b83e6db89495e74fa7516a9fbe5ecfd60
+- package: github.com/btcsuite/golangcrypto
+  subpackages:
+  - nacl/secretbox
+  - ripemd160
+  - scrypt
+  - ssh/terminal
+- package: github.com/btcsuite/websocket
+- package: github.com/golang/protobuf
+  subpackages:
+  - proto
+- package: github.com/jessevdk/go-flags
+  version: 1679536dcc895411a9f5848d9a0250be7856448c
+- package: golang.org/x/net
+  subpackages:
+  - context
+- package: google.golang.org/grpc
+  version: 1.0.3
+  subpackages:
+  - codes
+  - credentials
+  - grpclog
+- package: github.com/jrick/logrotate
+  subpackages:
+  - rotator
+testImport:
+- package: github.com/davecgh/go-spew
+  subpackages:
+  - spew

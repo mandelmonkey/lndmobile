@@ -1,0 +1,35 @@
+hash: edf51fbb3ee6f3e3f9e39d5ffc33739e8a2817f6c990042840594e867a8bc94a
+updated: 2017-06-24T21:22:50.234773431+03:00
+imports:
+- name: github.com/aead/chacha20
+  version: d31a916ded42d1640b9d89a26f8abd53cc96790c
+  subpackages:
+  - chacha
+- name: github.com/btcsuite/fastsha256
+  version: 637e656429416087660c84436a2a035d69d54e2e
+- name: github.com/btcsuite/golangcrypto
+  version: 53f62d9b43e87a6c56975cf862af7edf33a8d0df
+  subpackages:
+  - ripemd160
+- name: github.com/go-errors/errors
+  version: 8fa88b06e5974e97fbf9899a7f86a344bfd1f105
+- name: github.com/roasbeef/btcd
+  version: 707a14a79daeb2440fe92feaeceb0fae68ab3e9b
+  subpackages:
+  - btcec
+  - chaincfg
+  - chaincfg/chainhash
+  - wire
+- name: github.com/roasbeef/btcutil
+  version: d347e49b656d2a7f6d06cc9e2daebc5acded5728
+  subpackages:
+  - base58
+- name: golang.org/x/crypto
+  version: 459e26527287adbc2adcc5d0d49abff9a5f315a7
+  subpackages:
+  - ripemd160
+testImports:
+- name: github.com/davecgh/go-spew
+  version: 346938d642f2ec3594ed81d874461961cd0faa76
+  subpackages:
+  - spew
