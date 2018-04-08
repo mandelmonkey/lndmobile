@@ -69,7 +69,7 @@ type ContractResolver interface {
 // given ContractResolver implementation. It contains all the items that a
 // resolver requires to carry out its duties.
 type ResolverKit struct {
-	// ChannelArbiratorConfig contains all the interfaces and closures
+	// ChannelArbitratorConfig contains all the interfaces and closures
 	// required for the resolver to interact with outside sub-systems.
 	ChannelArbitratorConfig
 
@@ -482,23 +482,24 @@ func (h *htlcSuccessResolver) Resolve() (ContractResolver, error) {
 			//
 			// TODO(roasbeef): signal up if fee would be too large
 			// to sweep singly, need to batch
-			satWeight, err := h.FeeEstimator.EstimateFeePerWeight(6)
+			feePerVSize, err := h.FeeEstimator.EstimateFeePerVSize(6)
 			if err != nil {
 				return nil, err
 			}
 
-			log.Debugf("%T(%x): using %v sat/weight to sweep htlc"+
+			log.Debugf("%T(%x): using %v sat/vbyte to sweep htlc"+
 				"incoming+remote htlc confirmed", h,
-				h.payHash[:], int64(satWeight))
+				h.payHash[:], int64(feePerVSize))
 
 			// Using a weight estimator, we'll compute the total
 			// fee required, and from that the value we'll end up
 			// with.
-			totalWeight := (&lnwallet.TxWeightEstimator{}).
+			totalVSize := (&lnwallet.TxWeightEstimator{}).
 				AddWitnessInput(lnwallet.OfferedHtlcSuccessWitnessSize).
-				AddP2WKHOutput().Weight()
-			totalFees := int64(totalWeight) * int64(satWeight)
-			sweepAmt := h.htlcResolution.SweepSignDesc.Output.Value - totalFees
+				AddP2WKHOutput().VSize()
+			totalFees := feePerVSize.FeeForVSize(int64(totalVSize))
+			sweepAmt := h.htlcResolution.SweepSignDesc.Output.Value -
+				int64(totalFees)
 
 			// With the fee computation finished, we'll now
 			// construct the sweep transaction.
@@ -582,7 +583,6 @@ func (h *htlcSuccessResolver) Resolve() (ContractResolver, error) {
 	//
 	// TODO(roasbeef): after changing sighashes send to tx bundler
 	if err := h.PublishTx(h.htlcResolution.SignedSuccessTx); err != nil {
-		// TODO(roasbeef): detect double spends
 		return nil, err
 	}
 
@@ -865,6 +865,8 @@ func (h *htlcOutgoingContestResolver) Resolve() (ContractResolver, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer blockEpochs.Cancel()
+
 	for {
 		select {
 
@@ -958,7 +960,7 @@ var _ ContractResolver = (*htlcOutgoingContestResolver)(nil)
 // it hasn't expired. In this case, we can resolve the HTLC if we learn of the
 // preimage, otherwise the remote party will sweep it after it expires.
 //
-// TODO(roabseef): just embed the other resolver?
+// TODO(roasbeef): just embed the other resolver?
 type htlcIncomingContestResolver struct {
 	// htlcExpiry is the absolute expiry of this incoming HTLC. We use this
 	// value to determine if we can exit early as if the HTLC times out,
@@ -1053,12 +1055,15 @@ func (h *htlcIncomingContestResolver) Resolve() (ContractResolver, error) {
 	// If the HTLC hasn't expired yet, then we may still be able to claim
 	// it if we learn of the pre-image, so we'll wait and see if it pops
 	// up, or the HTLC times out.
-	preimageSubscription := h.PreimageDB.SubcribeUpdates()
+	preimageSubscription := h.PreimageDB.SubscribeUpdates()
 	blockEpochs, err := h.Notifier.RegisterBlockEpochNtfn()
 	if err != nil {
 		return nil, err
 	}
-	defer preimageSubscription.CancelSubcription()
+	defer func() {
+		preimageSubscription.CancelSubscription()
+		blockEpochs.Cancel()
+	}()
 	for {
 
 		select {
@@ -1248,19 +1253,19 @@ func (c *commitSweepResolver) Resolve() (ContractResolver, error) {
 		// First, we'll estimate the total weight so we can compute
 		// fees properly. We'll use a lax estimate, as this output is
 		// in no immediate danger.
-		satWeight, err := c.FeeEstimator.EstimateFeePerWeight(6)
+		feePerVSize, err := c.FeeEstimator.EstimateFeePerVSize(6)
 		if err != nil {
 			return nil, err
 		}
 
-		log.Debugf("%T(%v): using %v sat/weight for sweep tx", c,
-			c.chanPoint, int64(satWeight))
+		log.Debugf("%T(%v): using %v sat/vsize for sweep tx", c,
+			c.chanPoint, int64(feePerVSize))
 
-		totalWeight := (&lnwallet.TxWeightEstimator{}).
+		totalVSize := (&lnwallet.TxWeightEstimator{}).
 			AddP2PKHInput().
-			AddP2WKHOutput().Weight()
-		totalFees := int64(totalWeight) * int64(satWeight)
-		sweepAmt := signDesc.Output.Value - totalFees
+			AddP2WKHOutput().VSize()
+		totalFees := feePerVSize.FeeForVSize(int64(totalVSize))
+		sweepAmt := signDesc.Output.Value - int64(totalFees)
 
 		c.sweepTx = wire.NewMsgTx(2)
 		c.sweepTx.AddTxIn(&wire.TxIn{

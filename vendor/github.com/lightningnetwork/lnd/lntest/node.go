@@ -18,7 +18,7 @@ import (
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
-	macaroon "gopkg.in/macaroon.v1"
+	macaroon "gopkg.in/macaroon.v2"
 
 	"github.com/go-errors/errors"
 	"github.com/lightningnetwork/lnd/lnrpc"
@@ -35,7 +35,7 @@ var (
 
 	// defaultNodePort is the initial p2p port which will be used by the
 	// first created lightning node to listen on for incoming p2p
-	// connections.  Subsequent allocated ports for future lighting nodes
+	// connections.  Subsequent allocated ports for future Lightning nodes
 	// instances will be monotonically increasing numbers calculated as
 	// such: defaultP2pPort + (3 * harness.nodeNum).
 	defaultNodePort = 19555
@@ -90,15 +90,17 @@ type nodeConfig struct {
 	BaseDir   string
 	ExtraArgs []string
 
-	DataDir      string
-	LogDir       string
-	TLSCertPath  string
-	TLSKeyPath   string
-	AdminMacPath string
-	ReadMacPath  string
-	P2PPort      int
-	RPCPort      int
-	RESTPort     int
+	DataDir        string
+	LogDir         string
+	TLSCertPath    string
+	TLSKeyPath     string
+	AdminMacPath   string
+	ReadMacPath    string
+	InvoiceMacPath string
+
+	P2PPort  int
+	RPCPort  int
+	RESTPort int
 }
 
 func (cfg nodeConfig) P2PAddr() string {
@@ -114,7 +116,7 @@ func (cfg nodeConfig) RESTAddr() string {
 }
 
 func (cfg nodeConfig) DBPath() string {
-	return filepath.Join(cfg.DataDir, cfg.NetParams.Name, "bitcoin/channel.db")
+	return filepath.Join(cfg.DataDir, "graph", "simnet/channel.db")
 }
 
 // genArgs generates a slice of command line arguments from the lightning node
@@ -145,6 +147,7 @@ func (cfg nodeConfig) genArgs() []string {
 	args = append(args, fmt.Sprintf("--rpclisten=%v", cfg.RPCAddr()))
 	args = append(args, fmt.Sprintf("--restlisten=%v", cfg.RESTAddr()))
 	args = append(args, fmt.Sprintf("--listen=%v", cfg.P2PAddr()))
+	args = append(args, fmt.Sprintf("--externalip=%v", cfg.P2PAddr()))
 	args = append(args, fmt.Sprintf("--logdir=%v", cfg.LogDir))
 	args = append(args, fmt.Sprintf("--datadir=%v", cfg.DataDir))
 	args = append(args, fmt.Sprintf("--tlscertpath=%v", cfg.TLSCertPath))
@@ -152,6 +155,7 @@ func (cfg nodeConfig) genArgs() []string {
 	args = append(args, fmt.Sprintf("--configfile=%v", cfg.DataDir))
 	args = append(args, fmt.Sprintf("--adminmacaroonpath=%v", cfg.AdminMacPath))
 	args = append(args, fmt.Sprintf("--readonlymacaroonpath=%v", cfg.ReadMacPath))
+	args = append(args, fmt.Sprintf("--invoicemacaroonpath=%v", cfg.InvoiceMacPath))
 	args = append(args, fmt.Sprintf("--externalip=%s", cfg.P2PAddr()))
 	args = append(args, fmt.Sprintf("--trickledelay=%v", trickleDelay))
 
@@ -211,6 +215,7 @@ func newNode(cfg nodeConfig) (*HarnessNode, error) {
 	cfg.TLSKeyPath = filepath.Join(cfg.DataDir, "tls.key")
 	cfg.AdminMacPath = filepath.Join(cfg.DataDir, "admin.macaroon")
 	cfg.ReadMacPath = filepath.Join(cfg.DataDir, "readonly.macaroon")
+	cfg.InvoiceMacPath = filepath.Join(cfg.DataDir, "invoice.macaroon")
 
 	cfg.P2PPort, cfg.RPCPort, cfg.RESTPort = generateListeningPorts()
 
@@ -239,7 +244,8 @@ func (hn *HarnessNode) start(lndError chan<- error) error {
 	hn.quit = make(chan struct{})
 
 	args := hn.cfg.genArgs()
-	hn.cmd = exec.Command("lnd", args...)
+	args = append(args, fmt.Sprintf("--profile=%d", 9000+hn.NodeID))
+	hn.cmd = exec.Command("./lnd", args...)
 
 	// Redirect stderr output to buffer
 	var errb bytes.Buffer
@@ -317,7 +323,7 @@ func (hn *HarnessNode) start(lndError chan<- error) error {
 	}
 	copy(hn.PubKey[:], pubkey)
 
-	// Launch the watcher that'll hook into graph related topology change
+	// Launch the watcher that will hook into graph related topology change
 	// from the PoV of this node.
 	hn.wg.Add(1)
 	go hn.lightningNetworkWatcher()
@@ -394,6 +400,12 @@ func (hn *HarnessNode) connectRPC() (*grpc.ClientConn, error) {
 	return grpc.Dial(hn.cfg.RPCAddr(), opts...)
 }
 
+// SetExtraArgs assigns the ExtraArgs field for the node's configuration. The
+// changes will take effect on restart.
+func (hn *HarnessNode) SetExtraArgs(extraArgs []string) {
+	hn.cfg.ExtraArgs = extraArgs
+}
+
 // cleanup cleans up all the temporary files created by the node's process.
 func (hn *HarnessNode) cleanup() error {
 	return os.RemoveAll(hn.cfg.BaseDir)
@@ -448,6 +460,29 @@ type chanWatchRequest struct {
 	chanOpen bool
 
 	eventChan chan struct{}
+}
+
+// getChanPointFundingTxid returns the given channel point's funding txid in
+// raw bytes.
+func getChanPointFundingTxid(chanPoint *lnrpc.ChannelPoint) ([]byte, error) {
+	var txid []byte
+
+	// A channel point's funding txid can be get/set as a byte slice or a
+	// string. In the case it is a string, decode it.
+	switch chanPoint.GetFundingTxid().(type) {
+	case *lnrpc.ChannelPoint_FundingTxidBytes:
+		txid = chanPoint.GetFundingTxidBytes()
+	case *lnrpc.ChannelPoint_FundingTxidStr:
+		s := chanPoint.GetFundingTxidStr()
+		h, err := chainhash.NewHashFromStr(s)
+		if err != nil {
+			return nil, err
+		}
+
+		txid = h[:]
+	}
+
+	return txid, nil
 }
 
 // lightningNetworkWatcher is a goroutine which is able to dispatch
@@ -510,7 +545,8 @@ func (hn *HarnessNode) lightningNetworkWatcher() {
 			// For each new channel, we'll increment the number of
 			// edges seen by one.
 			for _, newChan := range graphUpdate.ChannelUpdates {
-				txid, _ := chainhash.NewHash(newChan.ChanPoint.FundingTxid)
+				txidHash, _ := getChanPointFundingTxid(newChan.ChanPoint)
+				txid, _ := chainhash.NewHash(txidHash)
 				op := wire.OutPoint{
 					Hash:  *txid,
 					Index: newChan.ChanPoint.OutputIndex,
@@ -536,7 +572,8 @@ func (hn *HarnessNode) lightningNetworkWatcher() {
 			// detected a channel closure while lnd was pruning the
 			// channel graph.
 			for _, closedChan := range graphUpdate.ClosedChans {
-				txid, _ := chainhash.NewHash(closedChan.ChanPoint.FundingTxid)
+				txidHash, _ := getChanPointFundingTxid(closedChan.ChanPoint)
+				txid, _ := chainhash.NewHash(txidHash)
 				op := wire.OutPoint{
 					Hash:  *txid,
 					Index: closedChan.ChanPoint.OutputIndex,
@@ -603,7 +640,11 @@ func (hn *HarnessNode) WaitForNetworkChannelOpen(ctx context.Context,
 
 	eventChan := make(chan struct{})
 
-	txid, err := chainhash.NewHash(op.FundingTxid)
+	txidHash, err := getChanPointFundingTxid(op)
+	if err != nil {
+		return err
+	}
+	txid, err := chainhash.NewHash(txidHash)
 	if err != nil {
 		return err
 	}
@@ -634,7 +675,11 @@ func (hn *HarnessNode) WaitForNetworkChannelClose(ctx context.Context,
 
 	eventChan := make(chan struct{})
 
-	txid, err := chainhash.NewHash(op.FundingTxid)
+	txidHash, err := getChanPointFundingTxid(op)
+	if err != nil {
+		return err
+	}
+	txid, err := chainhash.NewHash(txidHash)
 	if err != nil {
 		return err
 	}

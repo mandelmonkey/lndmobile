@@ -11,6 +11,7 @@ import (
 	"github.com/btcsuite/btclog"
 	"github.com/jrick/logrotate/rotator"
 	"github.com/lightninglabs/neutrino"
+	"github.com/lightningnetwork/lightning-onion"
 	"github.com/lightningnetwork/lnd/autopilot"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
@@ -32,7 +33,7 @@ func (logWriter) Write(p []byte) (n int, err error) {
 	return len(p), nil
 }
 
-// Loggers per subsystem.  A single backend logger is created and all subsytem
+// Loggers per subsystem.  A single backend logger is created and all subsystem
 // loggers created from it will write to the backend.  When adding new
 // subsystems, add the subsystem logger variable here and to the
 // subsystemLoggers map.
@@ -72,6 +73,7 @@ var (
 	btcnLog = backendLog.Logger("BTCN")
 	atplLog = backendLog.Logger("ATPL")
 	cnctLog = backendLog.Logger("CNCT")
+	sphxLog = backendLog.Logger("SPHX")
 )
 
 // Initialize package-global logger variables.
@@ -86,6 +88,7 @@ func init() {
 	neutrino.UseLogger(btcnLog)
 	autopilot.UseLogger(atplLog)
 	contractcourt.UseLogger(cnctLog)
+	sphinx.UseLogger(sphxLog)
 }
 
 // subsystemLoggers maps each subsystem identifier to its associated logger.
@@ -107,6 +110,7 @@ var subsystemLoggers = map[string]btclog.Logger{
 	"BTCN": btcnLog,
 	"ATPL": atplLog,
 	"CNCT": cnctLog,
+	"SPHX": sphxLog,
 }
 
 // initLogRotator initializes the logging rotator to write logs to logFile and

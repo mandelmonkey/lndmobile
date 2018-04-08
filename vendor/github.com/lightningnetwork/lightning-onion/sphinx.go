@@ -8,9 +8,10 @@ import (
 	"encoding/binary"
 	"io"
 	"io/ioutil"
-	"sync"
+	"math/big"
 
 	"github.com/aead/chacha20"
+	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/roasbeef/btcd/btcec"
 	"github.com/roasbeef/btcd/chaincfg"
 	"github.com/roasbeef/btcutil"
@@ -66,6 +67,10 @@ const (
 	// baseVersion represent the current supported version of onion packet.
 	baseVersion = 0
 )
+
+// Hash256 is a statically sized, 32-byte array, typically containing
+// the output of a SHA256 hash.
+type Hash256 [sha256.Size]byte
 
 var (
 	// paddingBytes are the padding bytes used to fill out the remainder of the
@@ -204,44 +209,67 @@ func (hd *HopData) Decode(r io.Reader) error {
 // generateSharedSecrets by the given nodes pubkeys, generates the shared
 // secrets.
 func generateSharedSecrets(paymentPath []*btcec.PublicKey,
-	sessionKey *btcec.PrivateKey) [][sha256.Size]byte {
+	sessionKey *btcec.PrivateKey) []Hash256 {
 	// Each hop performs ECDH with our ephemeral key pair to arrive at a
 	// shared secret. Additionally, each hop randomizes the group element
 	// for the next hop by multiplying it by the blinding factor. This way
 	// we only need to transmit a single group element, and hops can't link
 	// a session back to us if they have several nodes in the path.
 	numHops := len(paymentPath)
-	hopEphemeralPubKeys := make([]*btcec.PublicKey, numHops)
-	hopSharedSecrets := make([][sha256.Size]byte, numHops)
-	hopBlindingFactors := make([][sha256.Size]byte, numHops)
+	hopSharedSecrets := make([]Hash256, numHops)
 
 	// Compute the triplet for the first hop outside of the main loop.
 	// Within the loop each new triplet will be computed recursively based
 	// off of the blinding factor of the last hop.
-	hopEphemeralPubKeys[0] = sessionKey.PubKey()
+	lastEphemeralPubKey := sessionKey.PubKey()
 	hopSharedSecrets[0] = generateSharedSecret(paymentPath[0], sessionKey)
-	hopBlindingFactors[0] = computeBlindingFactor(hopEphemeralPubKeys[0], hopSharedSecrets[0][:])
+	lastBlindingFactor := computeBlindingFactor(lastEphemeralPubKey, hopSharedSecrets[0][:])
 
-	// Now recursively compute the ephemeral ECDH pub keys, the shared
-	// secret, and blinding factor for each hop.
+	// The cached blinding factor will contain the running product of the
+	// session private key x and blinding factors b_i, computed as
+	//   c_0 = x
+	//   c_i = c_{i-1} * b_{i-1} 		 (mod |F(G)|).
+	//       = x * b_0 * b_1 * ... * b_{i-1} (mod |F(G)|).
+	//
+	// We begin with just the session private key x, so that base case
+	// c_0 = x. At the beginning of each iteration, the previous blinding
+	// factor is aggregated into the modular product, and used as the scalar
+	// value in deriving the hop ephemeral keys and shared secrets.
+	var cachedBlindingFactor big.Int
+	cachedBlindingFactor.SetBytes(sessionKey.D.Bytes())
+
+	// Now recursively compute the cached blinding factor, ephemeral ECDH
+	// pub keys, and shared secret for each hop.
+	var nextBlindingFactor big.Int
 	for i := 1; i <= numHops-1; i++ {
-		// a_{n} = a_{n-1} x c_{n-1} -> (Y_prev_pub_key x prevBlindingFactor)
-		hopEphemeralPubKeys[i] = blindGroupElement(hopEphemeralPubKeys[i-1],
-			hopBlindingFactors[i-1][:])
+		// Update the cached blinding factor with b_{i-1}.
+		nextBlindingFactor.SetBytes(lastBlindingFactor[:])
+		cachedBlindingFactor.Mul(&cachedBlindingFactor, &nextBlindingFactor)
+		cachedBlindingFactor.Mod(&cachedBlindingFactor, btcec.S256().Params().N)
 
-		// s_{n} = sha256( y_{n} x c_{n-1} ) ->
+		// a_i = g ^ c_i
+		//     = g^( x * b_0 * ... * b_{i-1} )
+		//     = X^( b_0 * ... * b_{i-1} )
+		// X_our_session_pub_key x all prev blinding factors
+		lastEphemeralPubKey = blindBaseElement(cachedBlindingFactor.Bytes())
+
+		// e_i = Y_i ^ c_i
+		//     = ( Y_i ^ x )^( b_0 * ... * b_{i-1} )
 		// (Y_their_pub_key x x_our_priv) x all prev blinding factors
-		yToX := blindGroupElement(paymentPath[i], sessionKey.D.Bytes())
-		hopSharedSecrets[i] = sha256.Sum256(
-			multiScalarMult(
-				yToX,
-				hopBlindingFactors[:i],
-			).SerializeCompressed(),
-		)
+		hopBlindedPubKey := blindGroupElement(
+			paymentPath[i], cachedBlindingFactor.Bytes())
 
-		// TODO(roasbeef): prob don't need to store all blinding factors, only the prev...
-		// b_{n} = sha256(a_{n} || s_{n})
-		hopBlindingFactors[i] = computeBlindingFactor(hopEphemeralPubKeys[i],
+		// s_i = sha256( e_i )
+		//     = sha256( Y_i ^ (x * b_0 * ... * b_{i-1} )
+		hopSharedSecrets[i] = sha256.Sum256(hopBlindedPubKey.SerializeCompressed())
+
+		// Only need to evaluate up to the penultimate blinding factor.
+		if i >= numHops-1 {
+			break
+		}
+
+		// b_i = sha256( a_i || s_i )
+		lastBlindingFactor = computeBlindingFactor(lastEphemeralPubKey,
 			hopSharedSecrets[i][:])
 	}
 
@@ -275,8 +303,8 @@ func NewOnionPacket(paymentPath []*btcec.PublicKey, sessionKey *btcec.PrivateKey
 		// We'll derive the two keys we need for each hop in order to:
 		// generate our stream cipher bytes for the mixHeader, and
 		// calculate the MAC over the entire constructed packet.
-		rhoKey := generateKey("rho", hopSharedSecrets[i])
-		muKey := generateKey("mu", hopSharedSecrets[i])
+		rhoKey := generateKey("rho", &hopSharedSecrets[i])
+		muKey := generateKey("mu", &hopSharedSecrets[i])
 
 		// The HMAC for the final hop is simply zeroes. This allows the
 		// last hop to recognize that it is the destination for a
@@ -353,13 +381,13 @@ func rightShift(slice []byte, num int) {
 // "filler" bytes produced by this function at the last hop. Using this
 // methodology, the size of the field stays constant at each hop.
 func generateHeaderPadding(key string, numHops int, hopSize int,
-	sharedSecrets [][sharedSecretSize]byte) []byte {
+	sharedSecrets []Hash256) []byte {
 
 	filler := make([]byte, (numHops-1)*hopSize)
 	for i := 1; i < numHops; i++ {
 		totalFillerSize := ((NumMaxHops - i) + 1) * hopSize
 
-		streamKey := generateKey(key, sharedSecrets[i-1])
+		streamKey := generateKey(key, &sharedSecrets[i-1])
 		streamBytes := generateCipherStream(streamKey, numStreamBytes)
 
 		xor(filler, filler, streamBytes[totalFillerSize:totalFillerSize+i*hopSize])
@@ -460,7 +488,7 @@ func xor(dst, a, b []byte) int {
 // construction/processing based off of the denoted keyType. Within Sphinx
 // various keys are used within the same onion packet for padding generation,
 // MAC generation, and encryption/decryption.
-func generateKey(keyType string, sharedKey [sharedSecretSize]byte) [keyLen]byte {
+func generateKey(keyType string, sharedKey *Hash256) [keyLen]byte {
 	mac := hmac.New(sha256.New, []byte(keyType))
 	mac.Write(sharedKey[:])
 	h := mac.Sum(nil)
@@ -491,20 +519,29 @@ func generateCipherStream(key [keyLen]byte, numBytes uint) []byte {
 // computeBlindingFactor for the next hop given the ephemeral pubKey and
 // sharedSecret for this hop. The blinding factor is computed as the
 // sha-256(pubkey || sharedSecret).
-func computeBlindingFactor(hopPubKey *btcec.PublicKey, hopSharedSecret []byte) [sha256.Size]byte {
+func computeBlindingFactor(hopPubKey *btcec.PublicKey,
+	hopSharedSecret []byte) Hash256 {
+
 	sha := sha256.New()
 	sha.Write(hopPubKey.SerializeCompressed())
 	sha.Write(hopSharedSecret)
 
-	var hash [sha256.Size]byte
+	var hash Hash256
 	copy(hash[:], sha.Sum(nil))
 	return hash
 }
 
-// blindGroupElement blinds the group element by performing scalar
-// multiplication of the group element by blindingFactor: G x blindingFactor.
+// blindGroupElement blinds the group element P by performing scalar
+// multiplication of the group element by blindingFactor: blindingFactor * P.
 func blindGroupElement(hopPubKey *btcec.PublicKey, blindingFactor []byte) *btcec.PublicKey {
 	newX, newY := btcec.S256().ScalarMult(hopPubKey.X, hopPubKey.Y, blindingFactor[:])
+	return &btcec.PublicKey{btcec.S256(), newX, newY}
+}
+
+// blindBaseElement blinds the groups's generator G by performing scalar base
+// multiplication using the blindingFactor: blindingFactor * G.
+func blindBaseElement(blindingFactor []byte) *btcec.PublicKey {
+	newX, newY := btcec.S256().ScalarBaseMult(blindingFactor)
 	return &btcec.PublicKey{btcec.S256(), newX, newY}
 }
 
@@ -514,29 +551,13 @@ func blindGroupElement(hopPubKey *btcec.PublicKey, blindingFactor []byte) *btcec
 // key. We then take the _entire_ point generated by the ECDH operation,
 // serialize that using a compressed format, then feed the raw bytes through a
 // single SHA256 invocation.  The resulting value is the shared secret.
-func generateSharedSecret(pub *btcec.PublicKey, priv *btcec.PrivateKey) [32]byte {
+func generateSharedSecret(pub *btcec.PublicKey, priv *btcec.PrivateKey) Hash256 {
 	s := &btcec.PublicKey{}
 	x, y := btcec.S256().ScalarMult(pub.X, pub.Y, priv.D.Bytes())
 	s.X = x
 	s.Y = y
 
 	return sha256.Sum256(s.SerializeCompressed())
-}
-
-// multiScalarMult computes the cumulative product of the blinding factors
-// times the passed public key.
-//
-// TODO(roasbeef): optimize using totient?
-func multiScalarMult(hopPubKey *btcec.PublicKey,
-	blindingFactors [][sha256.Size]byte) *btcec.PublicKey {
-
-	finalPubKey := hopPubKey
-
-	for _, blindingFactor := range blindingFactors {
-		finalPubKey = blindGroupElement(finalPubKey, blindingFactor[:])
-	}
-
-	return finalPubKey
 }
 
 // ProcessCode is an enum-like type which describes to the high-level package
@@ -573,7 +594,7 @@ func (p ProcessCode) String() string {
 
 // ProcessedPacket encapsulates the resulting state generated after processing
 // an OnionPacket. A processed packet communicates to the caller what action
-// shuold be taken after processing.
+// should be taken after processing.
 type ProcessedPacket struct {
 	// Action represents the action the caller should take after processing
 	// the packet.
@@ -605,14 +626,13 @@ type Router struct {
 
 	onionKey *btcec.PrivateKey
 
-	sync.RWMutex
-
-	seenSecrets map[[sharedSecretSize]byte]struct{}
+	log ReplayLog
 }
 
 // NewRouter creates a new instance of a Sphinx onion Router given the node's
 // currently advertised onion private key, and the target Bitcoin network.
-func NewRouter(nodeKey *btcec.PrivateKey, net *chaincfg.Params) *Router {
+func NewRouter(dbPath string, nodeKey *btcec.PrivateKey, net *chaincfg.Params,
+	chainNotifier chainntnfs.ChainNotifier) *Router {
 	var nodeID [addressSize]byte
 	copy(nodeID[:], btcutil.Hash160(nodeKey.PubKey().SerializeCompressed()))
 
@@ -632,8 +652,20 @@ func NewRouter(nodeKey *btcec.PrivateKey, net *chaincfg.Params) *Router {
 		},
 		// TODO(roasbeef): replace instead with bloom filter?
 		// * https://moderncrypto.org/mail-archive/messaging/2015/001911.html
-		seenSecrets: make(map[[sharedSecretSize]byte]struct{}),
+		log: NewDecayedLog(dbPath, chainNotifier),
 	}
+}
+
+// Start starts / opens the DecayedLog's channeldb and its accompanying
+// garbage collector goroutine.
+func (r *Router) Start() error {
+	return r.log.Start()
+}
+
+// Stop stops / closes the DecayedLog's channeldb and its accompanying
+// garbage collector goroutine.
+func (r *Router) Stop() {
+	r.log.Stop()
 }
 
 // ProcessOnionPacket processes an incoming onion packet which has been forward
@@ -645,25 +677,60 @@ func NewRouter(nodeKey *btcec.PrivateKey, net *chaincfg.Params) *Router {
 // In the case of a successful packet processing, and ProcessedPacket struct is
 // returned which houses the newly parsed packet, along with instructions on
 // what to do next.
-func (r *Router) ProcessOnionPacket(onionPkt *OnionPacket, assocData []byte) (*ProcessedPacket, error) {
-	dhKey := onionPkt.EphemeralKey
-	routeInfo := onionPkt.RoutingInfo
-	headerMac := onionPkt.HeaderMAC
+func (r *Router) ProcessOnionPacket(onionPkt *OnionPacket,
+	assocData []byte, incomingCltv uint32) (*ProcessedPacket, error) {
 
+	// Compute the shared secret for this onion packet.
 	sharedSecret, err := r.generateSharedSecret(onionPkt.EphemeralKey)
 	if err != nil {
 		return nil, err
 	}
 
-	// In order to mitigate replay attacks, if we've seen this particular
-	// shared secret before, cease processing and just drop this forwarding
-	// message.
-	r.RLock()
-	if _, ok := r.seenSecrets[sharedSecret]; ok {
-		r.RUnlock()
-		return nil, ErrReplayedPacket
+	// Additionally, compute the hash prefix of the shared secret, which
+	// will serve as an identifier for detecting replayed packets.
+	hashPrefix := hashSharedSecret(&sharedSecret)
+
+	// Continue to optimistically process this packet, deferring replay
+	// protection until the end to reduce the penalty of multiple IO
+	// operations.
+	packet, err := processOnionPacket(onionPkt, &sharedSecret, assocData)
+	if err != nil {
+		return nil, err
 	}
-	r.RUnlock()
+
+	// Atomically compare this hash prefix with the contents of the on-disk
+	// log, persisting it only if this entry was not detected as a replay.
+	if err := r.log.Put(&hashPrefix, incomingCltv); err != nil {
+		return nil, err
+	}
+
+	return packet, nil
+}
+
+// ReconstructOnionPacket rederives the subsequent onion packet.
+// NOTE: This method does not do any sort of replay protection, and should only
+// be used to reconstruct packets that were successfully processed previously.
+func (r *Router) ReconstructOnionPacket(onionPkt *OnionPacket,
+	assocData []byte) (*ProcessedPacket, error) {
+
+	// Compute the shared secret for this onion packet.
+	sharedSecret, err := r.generateSharedSecret(onionPkt.EphemeralKey)
+	if err != nil {
+		return nil, err
+	}
+
+	return processOnionPacket(onionPkt, &sharedSecret, assocData)
+}
+
+// processOnionPacket performs the primary key derivation and handling of onion
+// packets. The processed packets returned from this method should only be used
+// if the packet was not flagged as a replayed packet.
+func processOnionPacket(onionPkt *OnionPacket,
+	sharedSecret *Hash256, assocData []byte) (*ProcessedPacket, error) {
+
+	dhKey := onionPkt.EphemeralKey
+	routeInfo := onionPkt.RoutingInfo
+	headerMac := onionPkt.HeaderMAC
 
 	// Using the derived shared secret, ensure the integrity of the routing
 	// information by checking the attached MAC without leaking timing
@@ -674,24 +741,17 @@ func (r *Router) ProcessOnionPacket(onionPkt *OnionPacket, assocData []byte) (*P
 		return nil, ErrInvalidOnionHMAC
 	}
 
-	// The MAC checks out, mark this current shared secret as processed in
-	// order to mitigate future replay attacks. We need to check to see if
-	// we already know the secret again since a replay might have happened
-	// while we were checking the MAC.
-	r.Lock()
-	if _, ok := r.seenSecrets[sharedSecret]; ok {
-		r.RUnlock()
-		return nil, ErrReplayedPacket
-	}
-	r.seenSecrets[sharedSecret] = struct{}{}
-	r.Unlock()
-
 	// Attach the padding zeroes in order to properly strip an encryption
 	// layer off the routing info revealing the routing information for the
 	// next hop.
+	streamBytes := generateCipherStream(
+		generateKey("rho", sharedSecret),
+		numStreamBytes,
+	)
+	headerWithPadding := append(routeInfo[:],
+		bytes.Repeat([]byte{0}, hopDataSize)...)
+
 	var hopInfo [numStreamBytes]byte
-	streamBytes := generateCipherStream(generateKey("rho", sharedSecret), numStreamBytes)
-	headerWithPadding := append(routeInfo[:], bytes.Repeat([]byte{0}, hopDataSize)...)
 	xor(hopInfo[:], headerWithPadding, streamBytes)
 
 	// Randomize the DH group element for the next hop using the
@@ -722,7 +782,7 @@ func (r *Router) ProcessOnionPacket(onionPkt *OnionPacket, assocData []byte) (*P
 	// However if the uncovered 'nextMac' is all zeroes, then this
 	// indicates that we're the final hop in the route.
 	var action ProcessCode = MoreHops
-	if bytes.Compare(bytes.Repeat([]byte{0x00}, hmacSize), hopData.HMAC[:]) == 0 {
+	if bytes.Compare(zeroHMAC[:], hopData.HMAC[:]) == 0 {
 		action = ExitNode
 	}
 
@@ -734,9 +794,9 @@ func (r *Router) ProcessOnionPacket(onionPkt *OnionPacket, assocData []byte) (*P
 }
 
 // generateSharedSecret generates the shared secret by given ephemeral key.
-func (r *Router) generateSharedSecret(dhKey *btcec.PublicKey) ([sha256.Size]byte,
+func (r *Router) generateSharedSecret(dhKey *btcec.PublicKey) (Hash256,
 	error) {
-	var sharedSecret [sha256.Size]byte
+	var sharedSecret Hash256
 
 	// Ensure that the public key is on our curve.
 	if !btcec.S256().IsOnCurve(dhKey.X, dhKey.Y) {
@@ -746,4 +806,97 @@ func (r *Router) generateSharedSecret(dhKey *btcec.PublicKey) ([sha256.Size]byte
 	// Compute our shared secret.
 	sharedSecret = generateSharedSecret(dhKey, r.onionKey)
 	return sharedSecret, nil
+}
+
+// Tx is a transaction consisting of a number of sphinx packets to be atomically
+// written to the replay log. This structure helps to coordinate construction of
+// the underlying Batch object, and to ensure that the result of the processing
+// is idempotent.
+type Tx struct {
+	// batch is the set of packets to be incrementally processed and
+	// ultimately committed in this transaction
+	batch *Batch
+
+	// router is a reference to the sphinx router that created this
+	// transaction. Committing this transaction will utilize this router's
+	// replay log.
+	router *Router
+
+	// packets contains a potentially sparse list of optimistically processed
+	// packets for this batch. The contents of a particular index should
+	// only be accessed if the index is *not* included in the replay set, or
+	// otherwise failed any other stage of the processing.
+	packets []ProcessedPacket
+}
+
+// BeginTxn creates a new transaction that can later be committed back to the
+// sphinx router's replay log.
+//
+// NOTE: The nels parameter should represent the maximum number of that could be
+// added to the batch, using sequence numbers that match or exceed this value
+// could result in an out-of-bounds panic.
+func (r *Router) BeginTxn(id []byte, nels int) *Tx {
+	return &Tx{
+		batch:   NewBatch(id),
+		router:  r,
+		packets: make([]ProcessedPacket, nels),
+	}
+}
+
+// ProcessOnionPacket processes an incoming onion packet which has been forward
+// to the target Sphinx router. If the encoded ephemeral key isn't on the
+// target Elliptic Curve, then the packet is rejected. Similarly, if the
+// derived shared secret has been seen before the packet is rejected.  Finally
+// if the MAC doesn't check the packet is again rejected.
+//
+// In the case of a successful packet processing, and ProcessedPacket struct is
+// returned which houses the newly parsed packet, along with instructions on
+// what to do next.
+func (t *Tx) ProcessOnionPacket(seqNum uint16, onionPkt *OnionPacket,
+	assocData []byte, incomingCltv uint32) error {
+
+	// Compute the shared secret for this onion packet.
+	sharedSecret, err := t.router.generateSharedSecret(
+		onionPkt.EphemeralKey)
+	if err != nil {
+		return err
+	}
+
+	// Additionally, compute the hash prefix of the shared secret, which
+	// will serve as an identifier for detecting replayed packets.
+	hashPrefix := hashSharedSecret(&sharedSecret)
+
+	// Continue to optimistically process this packet, deferring replay
+	// protection until the end to reduce the penalty of multiple IO
+	// operations.
+	packet, err := processOnionPacket(onionPkt, &sharedSecret, assocData)
+	if err != nil {
+		return err
+	}
+
+	// Add the hash prefix to pending batch of shared secrets that will be
+	// written later via Commit().
+	err = t.batch.Put(seqNum, &hashPrefix, incomingCltv)
+	if err != nil {
+		return err
+	}
+
+	// If we successfully added this packet to the batch, cache the processed
+	// packet within the Tx which can be accessed after committing if this
+	// sequence number does not appear in the replay set.
+	t.packets[seqNum] = *packet
+
+	return nil
+}
+
+// Commit writes this transaction's batch of sphinx packets to the replay log,
+// performing a final check against the log for replays.
+func (t *Tx) Commit() ([]ProcessedPacket, *ReplaySet, error) {
+	if t.batch.isCommitted {
+		return t.packets, t.batch.replaySet, nil
+	}
+
+	rs, err := t.router.log.PutBatch(t.batch)
+
+	return t.packets, rs, err
 }

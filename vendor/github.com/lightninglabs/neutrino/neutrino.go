@@ -544,12 +544,39 @@ func (sp *ServerPeer) OnWrite(_ *peer.Peer, bytesWritten int, msg wire.Message, 
 
 // Config is a struct detailing the configuration of the chain service.
 type Config struct {
-	DataDir      string
-	Database     walletdb.DB
-	Namespace    []byte
-	ChainParams  chaincfg.Params
+	// DataDir is the directory that neutrino will store all header
+	// information within.
+	DataDir string
+
+	// Database is an *open* database instance that we'll use to storm
+	// indexes of teh chain.
+	Database walletdb.DB
+
+	// ChainParams is the chain that we're running on.
+	ChainParams chaincfg.Params
+
+	// ConnectPeers is a slice of hosts that should be connected to on
+	// startup, and be established as persistent peers.
+	//
+	// NOTE: If specified, we'll *only* connect to this set of peers and
+	// won't attempt to automatically seek outbound peers.
 	ConnectPeers []string
-	AddPeers     []string
+
+	// AddPeers is a slice of hosts that should be connected to on startup,
+	// and be maintained as persistent peers.
+	AddPeers []string
+
+	// Dialer is an optional function closure that will be used to
+	// establish outbound TCP connections. If specified, then the
+	// connection manager will use this in place of net.Dial for all
+	// outbound connection attempts.
+	Dialer func(addr net.Addr) (net.Conn, error)
+
+	// NameResolver is an optional function closure that will be used to
+	// lookup the IP of any host. If specified, then the address manager,
+	// along with regular outbound connection attempts will use this
+	// instead.
+	NameResolver func(host string) ([]net.IP, error)
 }
 
 // ChainService is instantiated with functional options
@@ -595,13 +622,45 @@ type ChainService struct {
 
 	userAgentName    string
 	userAgentVersion string
+
+	nameResolver func(string) ([]net.IP, error)
+	dialer       func(net.Addr) (net.Conn, error)
 }
 
 // NewChainService returns a new chain service configured to connect to the
 // bitcoin network type specified by chainParams.  Use start to begin syncing
 // with peers.
 func NewChainService(cfg Config) (*ChainService, error) {
-	amgr := addrmgr.New(cfg.DataDir, net.LookupIP)
+	// First, we'll sort out the methods that we'll use to established
+	// outbound TCP connections, as well as perform any DNS queries.
+	//
+	// If the dialler was specified, then we'll use that in place of the
+	// default net.Dial function.
+	var (
+		nameResolver func(string) ([]net.IP, error)
+		dialer       func(net.Addr) (net.Conn, error)
+	)
+	if cfg.Dialer != nil {
+		dialer = cfg.Dialer
+	} else {
+		dialer = func(addr net.Addr) (net.Conn, error) {
+			return net.Dial(addr.Network(), addr.String())
+		}
+	}
+
+	// Similarly, if the user specified as function to use for name
+	// resolution, then we'll use that everywhere as well.
+	if cfg.NameResolver != nil {
+		nameResolver = cfg.NameResolver
+	} else {
+		nameResolver = net.LookupIP
+	}
+
+	// When creating the addr manager, we'll check to see if the user has
+	// provided their own resolution function. If so, then we'll use that
+	// instead as this may be proxying requests over an anonymizing
+	// network.
+	amgr := addrmgr.New(cfg.DataDir, nameResolver)
 
 	s := ChainService{
 		chainParams:         cfg.ChainParams,
@@ -618,6 +677,8 @@ func NewChainService(cfg Config) (*ChainService, error) {
 		userAgentVersion:    UserAgentVersion,
 		blockSubscribers:    make(map[*blockSubscription]struct{}),
 		reorgedBlockHeaders: make(map[chainhash.Hash]*wire.BlockHeader),
+		nameResolver:        nameResolver,
+		dialer:              dialer,
 	}
 
 	var err error
@@ -697,10 +758,8 @@ func NewChainService(cfg Config) (*ChainService, error) {
 	cmgrCfg := &connmgr.Config{
 		RetryDuration:  ConnectionRetryInterval,
 		TargetOutbound: uint32(TargetOutbound),
-		Dial: func(addr net.Addr) (net.Conn, error) {
-			return net.Dial(addr.Network(), addr.String())
-		},
-		OnConnection: s.outboundPeerConnected,
+		OnConnection:   s.outboundPeerConnected,
+		Dial:           dialer,
 	}
 	if len(cfg.ConnectPeers) == 0 {
 		cmgrCfg.GetNewAddress = newAddressFunc
@@ -895,7 +954,7 @@ func (s *ChainService) peerHandler() {
 	if !DisableDNSSeed {
 		// Add peers discovered through DNS to the address manager.
 		connmgr.SeedFromDNS(&s.chainParams, RequiredServices,
-			net.LookupIP, func(addrs []*wire.NetAddress) {
+			s.nameResolver, func(addrs []*wire.NetAddress) {
 				// Bitcoind uses a lookup of the dns seeder here. This
 				// is rather strange since the values looked up by the
 				// DNS seed lookups will vary quite a lot.
@@ -977,10 +1036,11 @@ func (s *ChainService) addrStringToNetAddr(addr string) (net.Addr, error) {
 	}
 
 	// Attempt to look up an IP address associated with the parsed host.
-	ips, err := net.LookupIP(host)
+	ips, err := s.nameResolver(host)
 	if err != nil {
 		return nil, err
 	}
+
 	if len(ips) == 0 {
 		return nil, fmt.Errorf("no addresses found for %s", host)
 	}

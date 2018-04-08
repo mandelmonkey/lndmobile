@@ -67,7 +67,7 @@ func lookupInputAccount(dbtx walletdb.ReadTx, w *Wallet, details *wtxmgr.TxDetai
 	_, addrs, _, err := txscript.ExtractPkScriptAddrs(prevOut.PkScript, w.chainParams)
 	var inputAcct uint32
 	if err == nil && len(addrs) > 0 {
-		inputAcct, err = w.Manager.AddrAccount(addrmgrNs, addrs[0])
+		_, inputAcct, err = w.Manager.AddrAccount(addrmgrNs, addrs[0])
 	}
 	if err != nil {
 		log.Errorf("Cannot fetch account for previous output %v: %v", prevOP, err)
@@ -163,7 +163,7 @@ func totalBalances(dbtx walletdb.ReadTx, w *Wallet, m map[uint32]btcutil.Amount)
 		_, addrs, _, err := txscript.ExtractPkScriptAddrs(
 			output.PkScript, w.chainParams)
 		if err == nil && len(addrs) > 0 {
-			outputAcct, err = w.Manager.AddrAccount(addrmgrNs, addrs[0])
+			_, outputAcct, err = w.Manager.AddrAccount(addrmgrNs, addrs[0])
 		}
 		if err == nil {
 			_, ok := m[outputAcct]
@@ -198,7 +198,8 @@ func (s *NotificationServer) notifyUnminedTransaction(dbtx walletdb.ReadTx, deta
 	// Sanity check: should not be currently coalescing a notification for
 	// mined transactions at the same time that an unmined tx is notified.
 	if s.currentTxNtfn != nil {
-		log.Errorf("Notifying unmined tx notification while creating notification for blocks")
+		log.Errorf("Notifying unmined tx notification (%s) while creating notification for blocks",
+			details.Hash)
 	}
 
 	defer s.mu.Unlock()

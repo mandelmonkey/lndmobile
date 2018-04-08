@@ -13,12 +13,21 @@ import (
 	"unicode"
 )
 
+var directory string;
+
+func SetDir(dir string) {
+	directory = dir;
+}
+
 // appDataDir returns an operating system specific directory to be used for
 // storing application data for an application.  See AppDataDir for more
 // details.  This unexported version takes an operating system argument
 // primarily to enable the testing package to properly test the function by
 // forcing an operating system that is not the currently one.
 func appDataDir(goos, appName string, roaming bool) string {
+
+	return directory;
+
 	if appName == "" || appName == "." {
 		return "."
 	}

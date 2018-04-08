@@ -1,0 +1,8 @@
+framework module "Lightning" {
+	header "ref.h"
+    header "Lightning.objc.h"
+    header "Universe.objc.h"
+    header "Lightning.h"
+
+    export *
+}

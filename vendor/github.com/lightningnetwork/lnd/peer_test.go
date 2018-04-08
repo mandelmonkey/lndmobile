@@ -14,8 +14,6 @@ import (
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
-	"github.com/roasbeef/btcd/btcec"
-	"github.com/roasbeef/btcd/txscript"
 	"github.com/roasbeef/btcd/wire"
 	"github.com/roasbeef/btcutil"
 )
@@ -95,8 +93,7 @@ func TestPeerChannelClosureAcceptFeeResponder(t *testing.T) {
 		t.Fatalf("error creating close proposal: %v", err)
 	}
 
-	initSig := append(initiatorSig, byte(txscript.SigHashAll))
-	parsedSig, err := btcec.ParseSignature(initSig, btcec.S256())
+	parsedSig, err := lnwire.NewSigFromRawSignature(initiatorSig)
 	if err != nil {
 		t.Fatalf("error parsing signature: %v", err)
 	}
@@ -142,7 +139,7 @@ func TestPeerChannelClosureAcceptFeeInitiator(t *testing.T) {
 		CloseType:      htlcswitch.CloseRegular,
 		ChanPoint:      initiatorChan.ChannelPoint(),
 		Updates:        updateChan,
-		TargetFeePerKw: 12000,
+		TargetFeePerKw: 12500,
 		Err:            errChan,
 	}
 	initiator.localCloseChanReqs <- closeCommand
@@ -173,17 +170,18 @@ func TestPeerChannelClosureAcceptFeeInitiator(t *testing.T) {
 	}
 
 	estimator := lnwallet.StaticFeeEstimator{FeeRate: 50}
-	feeRate, err := estimator.EstimateFeePerWeight(1)
+	feeRate, err := estimator.EstimateFeePerVSize(1)
 	if err != nil {
 		t.Fatalf("unable to query fee estimator: %v", err)
 	}
-	fee := btcutil.Amount(responderChan.CalcFee(uint64(feeRate * 1000)))
+	feePerKw := feeRate.FeePerKWeight()
+	fee := responderChan.CalcFee(feePerKw)
 	closeSig, _, _, err := responderChan.CreateCloseProposal(fee,
 		dummyDeliveryScript, initiatorDeliveryScript)
 	if err != nil {
 		t.Fatalf("unable to create close proposal: %v", err)
 	}
-	parsedSig, err := btcec.ParseSignature(closeSig, btcec.S256())
+	parsedSig, err := lnwire.NewSigFromRawSignature(closeSig)
 	if err != nil {
 		t.Fatalf("unable to parse signature: %v", err)
 	}
@@ -295,7 +293,7 @@ func TestPeerChannelClosureFeeNegotiationsResponder(t *testing.T) {
 		t.Fatalf("error creating close proposal: %v", err)
 	}
 
-	parsedSig, err := btcec.ParseSignature(initiatorSig, btcec.S256())
+	parsedSig, err := lnwire.NewSigFromRawSignature(initiatorSig)
 	if err != nil {
 		t.Fatalf("error parsing signature: %v", err)
 	}
@@ -322,7 +320,7 @@ func TestPeerChannelClosureFeeNegotiationsResponder(t *testing.T) {
 	}
 
 	// The fee sent by the responder should be less than the fee we just
-	// sent as it should attempt to comrpomise.
+	// sent as it should attempt to compromise.
 	peerFee := responderClosingSigned.FeeSatoshis
 	if peerFee > increasedFee {
 		t.Fatalf("new fee should be less than our fee: new=%v, "+
@@ -339,7 +337,7 @@ func TestPeerChannelClosureFeeNegotiationsResponder(t *testing.T) {
 		t.Fatalf("error creating close proposal: %v", err)
 	}
 
-	parsedSig, err = btcec.ParseSignature(initiatorSig, btcec.S256())
+	parsedSig, err = lnwire.NewSigFromRawSignature(initiatorSig)
 	if err != nil {
 		t.Fatalf("error parsing signature: %v", err)
 	}
@@ -384,8 +382,7 @@ func TestPeerChannelClosureFeeNegotiationsResponder(t *testing.T) {
 		t.Fatalf("error creating close proposal: %v", err)
 	}
 
-	initSig := append(initiatorSig, byte(txscript.SigHashAll))
-	parsedSig, err = btcec.ParseSignature(initSig, btcec.S256())
+	parsedSig, err = lnwire.NewSigFromRawSignature(initiatorSig)
 	if err != nil {
 		t.Fatalf("error parsing signature: %v", err)
 	}
@@ -432,7 +429,7 @@ func TestPeerChannelClosureFeeNegotiationsInitiator(t *testing.T) {
 		CloseType:      htlcswitch.CloseRegular,
 		ChanPoint:      initiatorChan.ChannelPoint(),
 		Updates:        updateChan,
-		TargetFeePerKw: 12000,
+		TargetFeePerKw: 12500,
 		Err:            errChan,
 	}
 
@@ -464,12 +461,12 @@ func TestPeerChannelClosureFeeNegotiationsInitiator(t *testing.T) {
 	}
 
 	estimator := lnwallet.StaticFeeEstimator{FeeRate: 50}
-	initiatorIdealFeeRate, err := estimator.EstimateFeePerWeight(1)
+	initiatorIdealFeeRate, err := estimator.EstimateFeePerVSize(1)
 	if err != nil {
 		t.Fatalf("unable to query fee estimator: %v", err)
 	}
 	initiatorIdealFee := responderChan.CalcFee(
-		uint64(initiatorIdealFeeRate * 1000),
+		initiatorIdealFeeRate.FeePerKWeight(),
 	)
 	increasedFee := btcutil.Amount(float64(initiatorIdealFee) * 2.5)
 	closeSig, _, _, err := responderChan.CreateCloseProposal(
@@ -478,7 +475,7 @@ func TestPeerChannelClosureFeeNegotiationsInitiator(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unable to create close proposal: %v", err)
 	}
-	parsedSig, err := btcec.ParseSignature(closeSig, btcec.S256())
+	parsedSig, err := lnwire.NewSigFromRawSignature(closeSig)
 	if err != nil {
 		t.Fatalf("unable to parse signature: %v", err)
 	}
@@ -503,7 +500,7 @@ func TestPeerChannelClosureFeeNegotiationsInitiator(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected ClosingSigned message, got %T", msg)
 	}
-	if uint64(closingSignedMsg.FeeSatoshis) != initiatorIdealFee {
+	if closingSignedMsg.FeeSatoshis != initiatorIdealFee {
 		t.Fatalf("expected ClosingSigned fee to be %v, instead got %v",
 			initiatorIdealFee, closingSignedMsg.FeeSatoshis)
 	}
@@ -544,7 +541,7 @@ func TestPeerChannelClosureFeeNegotiationsInitiator(t *testing.T) {
 		t.Fatalf("error creating close proposal: %v", err)
 	}
 
-	parsedSig, err = btcec.ParseSignature(responderSig, btcec.S256())
+	parsedSig, err = lnwire.NewSigFromRawSignature(responderSig)
 	if err != nil {
 		t.Fatalf("error parsing signature: %v", err)
 	}
@@ -590,8 +587,7 @@ func TestPeerChannelClosureFeeNegotiationsInitiator(t *testing.T) {
 		t.Fatalf("error creating close proposal: %v", err)
 	}
 
-	respSig := append(responderSig, byte(txscript.SigHashAll))
-	parsedSig, err = btcec.ParseSignature(respSig, btcec.S256())
+	parsedSig, err = lnwire.NewSigFromRawSignature(responderSig)
 	if err != nil {
 		t.Fatalf("error parsing signature: %v", err)
 	}
